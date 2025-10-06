@@ -264,8 +264,6 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
   }
 });
 
-
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 // Vote endpoint
 app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
