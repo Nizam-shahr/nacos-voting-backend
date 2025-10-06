@@ -119,7 +119,6 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Enhanced Sign In with compulsory personal email and name validation
 app.post('/api/sign-in', signInLimiter, async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
@@ -141,10 +140,10 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid personal email format' });
   }
 
-  // Validate name-email consistency
-  const nameEmailValidation = validateNameEmailConsistency(fullName, personalEmail);
-  if (!nameEmailValidation.valid) {
-    return res.status(400).json({ error: nameEmailValidation.error });
+  // Validate full name has at least first and last name
+  const nameParts = fullName.trim().split(' ').filter(part => part.length > 1);
+  if (nameParts.length < 2) {
+    return res.status(400).json({ error: 'Please enter your complete first and last name' });
   }
 
   // Extract details from institutional email for validation
