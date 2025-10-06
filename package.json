@@ -1,8 +1,9 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -13,6 +14,7 @@
     "@getbrevo/brevo": "^2.5.0",
     "@sendgrid/mail": "^8.1.5",
     "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
     "express": "^5.1.0",
     "express-rate-limit": "^7.5.1",
     "firebase-admin": "^13.4.0",
