@@ -7,14 +7,10 @@ require('dotenv').config();
 const app = express();
 
 // Initialize Firebase Admin
-try {
-  admin.initializeApp({
-    credential: admin.credential.cert(require('./serviceAccountKey.json')),
-  });
-} catch (error) {
-  console.error('Error initializing Firebase Admin:', error);
-  process.exit(1);
-}
+const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 const db = admin.firestore();
 
 // Rate limiting
