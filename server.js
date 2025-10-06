@@ -47,6 +47,51 @@ const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
+// Function to validate name-email consistency
+const validateNameEmailConsistency = (fullName, personalEmail) => {
+  const normalizedName = fullName.toLowerCase().trim();
+  const normalizedEmail = personalEmail.toLowerCase().trim();
+  
+  // Extract name parts
+  const nameParts = normalizedName.split(' ').filter(part => part.length > 1);
+  
+  if (nameParts.length < 2) {
+    return { valid: false, error: 'Full name must include both first and last name' };
+  }
+  
+  const firstName = nameParts[0];
+  const lastName = nameParts[nameParts.length - 1];
+  
+  // Check if email contains parts of the name
+  const emailLocalPart = normalizedEmail.split('@')[0];
+  
+  // Common email patterns to check
+  const patterns = [
+    firstName + '.' + lastName,
+    firstName + lastName,
+    firstName.charAt(0) + lastName,
+    firstName + '.' + lastName.charAt(0),
+    firstName + '_' + lastName,
+    lastName + '.' + firstName,
+    firstName,
+    lastName
+  ];
+  
+  // Check if email matches any common pattern with the name
+  const matchesPattern = patterns.some(pattern => 
+    emailLocalPart.includes(pattern.toLowerCase())
+  );
+  
+  if (!matchesPattern) {
+    return { 
+      valid: false, 
+      error: 'Personal email should be consistent with your full name (e.g., john.doe@gmail.com for John Doe)' 
+    };
+  }
+  
+  return { valid: true };
+};
+
 // Session verification middleware
 const verifySession = async (req, res, next) => {
   const { institutionalEmail, sessionToken } = req.body;
@@ -74,14 +119,15 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Sign In endpoint
+// Enhanced Sign In with compulsory personal email and name validation
 app.post('/api/sign-in', signInLimiter, async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
-  if (!institutionalEmail || !matricNumber || !fullName) {
-    return res.status(400).json({ error: 'Missing required fields' });
+  if (!institutionalEmail || !matricNumber || !fullName || !personalEmail) {
+    return res.status(400).json({ error: 'All fields are required: institutional email, personal email, matric number, and full name' });
   }
 
+  // Validate institutional email format
   const institutionalEmailRegex = /^(22|23|24)03(cyb|sen|ins|cmp)\d{3}@alhikmah\.edu\.ng$/i;
   if (!institutionalEmailRegex.test(institutionalEmail.toLowerCase())) {
     return res.status(400).json({ 
@@ -89,17 +135,24 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
     });
   }
 
-  if (personalEmail) {
-    const personalEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!personalEmailRegex.test(personalEmail.toLowerCase())) {
-      return res.status(400).json({ error: 'Invalid personal email format' });
-    }
+  // Validate personal email format
+  const personalEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!personalEmailRegex.test(personalEmail.toLowerCase())) {
+    return res.status(400).json({ error: 'Invalid personal email format' });
   }
 
+  // Validate name-email consistency
+  const nameEmailValidation = validateNameEmailConsistency(fullName, personalEmail);
+  if (!nameEmailValidation.valid) {
+    return res.status(400).json({ error: nameEmailValidation.error });
+  }
+
+  // Extract details from institutional email for validation
   const emailParts = institutionalEmail.toLowerCase().split('@')[0];
   const year = emailParts.substring(0, 2);
   const department = emailParts.substring(4, 7);
 
+  // Validate matric number format
   const matricRegex = /^(22|23|24)\/03(cyb|sen|ins|cmp)\d{3}$/i;
   if (!matricRegex.test(matricNumber)) {
     return res.status(400).json({ error: 'Invalid matric number format' });
@@ -118,7 +171,7 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
   }
 
   const normalizedInstitutionalEmail = institutionalEmail.toLowerCase();
-  const normalizedPersonalEmail = personalEmail ? personalEmail.toLowerCase() : null;
+  const normalizedPersonalEmail = personalEmail.toLowerCase();
   const normalizedMatric = matricNumber.toLowerCase();
   const normalizedName = fullName.trim();
 
@@ -149,12 +202,10 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
         lastSignIn: admin.firestore.Timestamp.now(),
         lastIp: req.clientIp,
         sessionToken: sessionToken,
-        sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000))
+        sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
+        personalEmail: normalizedPersonalEmail, // Always update personal email
+        fullName: normalizedName // Update name if changed
       };
-
-      if (normalizedPersonalEmail) {
-        updateData.personalEmail = normalizedPersonalEmail;
-      }
 
       await db.collection('Users').doc(userId).update(updateData);
 
@@ -165,9 +216,9 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
       return res.status(200).json({ 
         message: 'Sign-in successful', 
         institutionalEmail: normalizedInstitutionalEmail,
-        personalEmail: normalizedPersonalEmail || userData.personalEmail,
+        personalEmail: normalizedPersonalEmail,
         matricNumber: normalizedMatric,
-        fullName: userData.fullName,
+        fullName: normalizedName,
         remainingPositions,
         sessionToken,
         continueVoting: true
@@ -213,6 +264,8 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
   }
 });
 
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 // Vote endpoint
 app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
