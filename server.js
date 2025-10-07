@@ -1,7 +1,6 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -20,183 +19,78 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Improved IP address tracking - Extract only the client IP
+// IP address tracking
 app.use((req, res, next) => {
   let clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress || req.socket.remoteAddress;
   
-  console.log('Raw IP info:', {
-    'x-forwarded-for': req.headers['x-forwarded-for'],
-    'connection.remoteAddress': req.connection.remoteAddress,
-    'socket.remoteAddress': req.socket.remoteAddress
-  });
-
-  // Handle multiple IPs in x-forwarded-for (common with proxies)
   if (clientIp && clientIp.includes(',')) {
-    // Take the first IP which is the original client IP
     clientIp = clientIp.split(',')[0].trim();
   }
   
-  // Remove IPv6 prefix if present
   if (clientIp && clientIp.startsWith('::ffff:')) {
     clientIp = clientIp.substring(7);
   }
 
-  // Fallback for invalid IPs
-  if (!clientIp || clientIp === '::1') {
-    clientIp = 'unknown';
-  }
-  
   req.clientIp = clientIp;
-  console.log('Final client IP:', clientIp);
+  console.log('Client IP:', clientIp);
   next();
 });
 
-// Generate device fingerprint
-const generateDeviceFingerprint = (req) => {
-  const fingerprintData = {
-    userAgent: req.headers['user-agent'] || 'unknown',
-    accept: req.headers['accept'] || 'unknown',
-    acceptLanguage: req.headers['accept-language'] || 'unknown',
-    acceptEncoding: req.headers['accept-encoding'] || 'unknown',
-    sec_ch_ua: req.headers['sec-ch-ua'] || 'unknown',
-    sec_ch_ua_platform: req.headers['sec-ch-ua-platform'] || 'unknown',
-    sec_ch_ua_mobile: req.headers['sec-ch-ua-mobile'] || 'unknown',
-    connection: req.headers['connection'] || 'unknown',
-    cacheControl: req.headers['cache-control'] || 'unknown'
-  };
-
-  // Create a hash of the fingerprint data
-  const fingerprintString = JSON.stringify(fingerprintData);
-  const fingerprintHash = crypto.createHash('md5').update(fingerprintString).digest('hex');
-  
-  console.log('🔍 Device Fingerprint:', {
-    hash: fingerprintHash,
-    userAgent: fingerprintData.userAgent,
-    ip: req.clientIp
-  });
-  
-  return {
-    hash: fingerprintHash,
-    data: fingerprintData,
-    combined: `${req.clientIp}_${fingerprintHash}`
-  };
+// Generate session token
+const generateSessionToken = () => {
+  return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
-// Store device fingerprint in database
-const storeDeviceFingerprint = async (fingerprint, institutionalEmail) => {
+// Check if IP has completed voting (ONLY check after all positions)
+const checkIPCompletedVoting = async (ipAddress) => {
   try {
-    const fingerprintRef = db.collection('DeviceFingerprints').doc();
-    await fingerprintRef.set({
-      fingerprintHash: fingerprint.hash,
-      ipAddress: fingerprint.data.ip || 'unknown',
-      userAgent: fingerprint.data.userAgent,
-      institutionalEmail: institutionalEmail,
-      combined: fingerprint.combined,
-      timestamp: admin.firestore.Timestamp.now(),
-      data: fingerprint.data
-    });
-    console.log('✅ Device fingerprint stored in database');
+    console.log('🔍 Checking if IP completed voting:', ipAddress);
+    
+    const completedIPs = await db.collection('CompletedVotingIPs')
+      .where('ipAddress', '==', ipAddress)
+      .get();
+
+    return !completedIPs.empty;
   } catch (error) {
-    console.error('Error storing fingerprint:', error);
+    console.error('Error checking IP completion:', error);
+    return false;
   }
 };
 
-// Check if device fingerprint exists in database
-const checkDeviceFingerprint = async (fingerprint) => {
+// Store IP as completed voting
+const storeIPAsCompleted = async (ipAddress, institutionalEmail) => {
   try {
-    console.log('🔍 Checking device fingerprint in database:', fingerprint.hash);
-    
-    // Check by combined fingerprint (IP + Hash)
-    const combinedQuery = await db.collection('DeviceFingerprints')
-      .where('combined', '==', fingerprint.combined)
-      .get();
-
-    if (!combinedQuery.empty) {
-      const doc = combinedQuery.docs[0];
-      console.log('🚫 Exact device match found in database:', doc.data().institutionalEmail);
-      return {
-        deviceFound: true,
-        foundUserEmail: doc.data().institutionalEmail,
-        matchType: 'EXACT_DEVICE'
-      };
-    }
-
-    // Check by fingerprint hash only (same device, different network)
-    const hashQuery = await db.collection('DeviceFingerprints')
-      .where('fingerprintHash', '==', fingerprint.hash)
-      .get();
-
-    if (!hashQuery.empty) {
-      const doc = hashQuery.docs[0];
-      console.log('🚫 Same device, different network found:', doc.data().institutionalEmail);
-      return {
-        deviceFound: true,
-        foundUserEmail: doc.data().institutionalEmail,
-        matchType: 'SAME_DEVICE_DIFFERENT_NETWORK'
-      };
-    }
-
-    // Check by IP only (same network, different device)
-    const ipQuery = await db.collection('DeviceFingerprints')
-      .where('ipAddress', '==', fingerprint.data.ip || 'unknown')
-      .get();
-
-    if (!ipQuery.empty) {
-      const doc = ipQuery.docs[0];
-      console.log('🚫 Same network IP found:', doc.data().institutionalEmail);
-      return {
-        deviceFound: true,
-        foundUserEmail: doc.data().institutionalEmail,
-        matchType: 'SAME_NETWORK'
-      };
-    }
-
-    console.log('✅ No matching device fingerprint found in database');
-    return {
-      deviceFound: false,
-      foundUserEmail: '',
-      matchType: ''
-    };
-
+    const completedRef = db.collection('CompletedVotingIPs').doc();
+    await completedRef.set({
+      ipAddress: ipAddress,
+      institutionalEmail: institutionalEmail,
+      completedAt: admin.firestore.Timestamp.now()
+    });
+    console.log('✅ IP stored as completed voting:', ipAddress);
   } catch (error) {
-    console.error('Error checking device fingerprint:', error);
-    return {
-      deviceFound: false,
-      foundUserEmail: '',
-      matchType: ''
-    };
+    console.error('Error storing completed IP:', error);
   }
 };
 
 // Check for duplicate personal email
 const checkDuplicatePersonalEmail = async (personalEmail) => {
   try {
-    console.log('🔍 Checking personal email:', personalEmail);
-    
     const users = await db.collection('Users').get();
     let duplicateFound = false;
     let duplicateEmail = '';
 
     users.docs.forEach(doc => {
       const userData = doc.data();
-      
       if (userData.personalEmail && userData.personalEmail.toLowerCase() === personalEmail.toLowerCase()) {
         duplicateFound = true;
         duplicateEmail = userData.institutionalEmail;
-        console.log('🚫 Personal email already used by:', duplicateEmail);
       }
     });
 
     return { duplicateFound, duplicateEmail };
   } catch (error) {
-    console.error('Error checking personal email:', error);
     return { duplicateFound: false, duplicateEmail: '' };
   }
-};
-
-// Generate session token
-const generateSessionToken = () => {
-  return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
 // Session verification middleware
@@ -226,12 +120,12 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Enhanced Sign In with DATABASE-BASED fingerprint tracking
+// Sign In - No IP checking during sign-in
 app.post('/api/sign-in', async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
   if (!institutionalEmail || !matricNumber || !fullName || !personalEmail) {
-    return res.status(400).json({ error: 'All fields are required: institutional email, personal email, matric number, and full name' });
+    return res.status(400).json({ error: 'All fields are required' });
   }
 
   // Validate institutional email format
@@ -248,7 +142,7 @@ app.post('/api/sign-in', async (req, res) => {
     return res.status(400).json({ error: 'Invalid personal email format' });
   }
 
-  // Validate full name has at least first and last name
+  // Validate full name
   const nameParts = fullName.trim().split(' ').filter(part => part.length > 1);
   if (nameParts.length < 2) {
     return res.status(400).json({ error: 'Please enter your complete first and last name' });
@@ -285,33 +179,17 @@ app.post('/api/sign-in', async (req, res) => {
   try {
     console.log('🔄 Sign-in attempt from IP:', req.clientIp, 'for:', institutionalEmail);
 
-    // Generate device fingerprint
-    const deviceFingerprint = generateDeviceFingerprint(req);
-    
-    // STEP 1: DATABASE-BASED Device Check
-    const { deviceFound, foundUserEmail, matchType } = await checkDeviceFingerprint(deviceFingerprint);
-    
-    if (deviceFound) {
-      console.log('🚫 Device blocked - Type:', matchType, 'User:', foundUserEmail);
-      return res.status(400).json({ 
-        error: "Can't sign-in/vote twice. You have already voted.",
-        deviceBlocked: true,
-        blockType: matchType
-      });
-    }
-
-    // STEP 2: Check for duplicate personal email
+    // Check for duplicate personal email only
     const { duplicateFound, duplicateEmail } = await checkDuplicatePersonalEmail(normalizedPersonalEmail);
     
     if (duplicateFound) {
-      console.log('🚫 DUPLICATE PERSONAL EMAIL - Already used by:', duplicateEmail);
       return res.status(400).json({ 
-        error: "Can't sign-in/vote twice. You have already voted.",
+        error: "This personal email has already been used by another student.",
         emailBlocked: true 
       });
     }
 
-    // STEP 3: Check for existing user (by institutional email)
+    // Check for existing user
     const userDocs = await db.collection('Users')
       .where('institutionalEmail', '==', normalizedInstitutionalEmail)
       .get();
@@ -321,21 +199,9 @@ app.post('/api/sign-in', async (req, res) => {
     let sessionToken = generateSessionToken();
 
     if (!userDocs.empty) {
+      // EXISTING USER - Check if they've completed voting
       userId = userDocs.docs[0].id;
       userData = userDocs.docs[0].data();
-      
-      // Check if this existing user's IP matches current IP
-      const existingUserIp = userData.ipAddress;
-      if (existingUserIp && existingUserIp.includes(req.clientIp)) {
-        console.log('User exists with same IP - allowing continuation');
-      } else {
-        // User exists but with different IP - BLOCK
-        console.log('User exists with different IP - BLOCKING:', existingUserIp, 'vs', req.clientIp);
-        return res.status(400).json({ 
-          error: "Can't sign-in/vote twice. You have already voted.",
-          ipBlocked: true 
-        });
-      }
       
       const positions = await db.collection('Candidates').get();
       const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
@@ -374,8 +240,7 @@ app.post('/api/sign-in', async (req, res) => {
       });
     }
 
-    // STEP 4: NEW USER CREATION (Device is clean)
-    console.log('✅ Creating new user - Device is clean');
+    // NEW USER - Create account
     const newUserRef = db.collection('Users').doc();
     userId = newUserRef.id;
 
@@ -386,8 +251,6 @@ app.post('/api/sign-in', async (req, res) => {
       fullName: normalizedName,
       votedPositions: [],
       ipAddress: req.clientIp,
-      deviceFingerprint: deviceFingerprint,
-      userAgent: req.headers['user-agent'],
       sessionToken: sessionToken,
       sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
       signInTimestamp: admin.firestore.Timestamp.now(),
@@ -397,9 +260,6 @@ app.post('/api/sign-in', async (req, res) => {
     };
 
     await newUserRef.set(userData);
-
-    // STORE FINGERPRINT IN DATABASE (PERSISTENT)
-    await storeDeviceFingerprint(deviceFingerprint, normalizedInstitutionalEmail);
 
     const positions = await db.collection('Candidates').get();
     const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
@@ -421,7 +281,7 @@ app.post('/api/sign-in', async (req, res) => {
   }
 });
 
-// Vote endpoint - Session verification only (device already checked during sign-in)
+// Vote endpoint - No IP checking during individual votes
 app.post('/api/vote', verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
 
@@ -456,7 +316,7 @@ app.post('/api/vote', verifySession, async (req, res) => {
         throw new Error('Candidate position mismatch');
       }
 
-      // Record the vote
+      // Record the vote (ALWAYS valid during voting session)
       const voteRef = db.collection('Votes').doc();
       transaction.set(voteRef, {
         candidateId,
@@ -465,9 +325,12 @@ app.post('/api/vote', verifySession, async (req, res) => {
         position,
         ipAddress: req.clientIp,
         timestamp: admin.firestore.Timestamp.now(),
-        userAgent: req.headers['user-agent']
+        userAgent: req.headers['user-agent'],
+        isValid: true, // All votes are valid during voting session
+        votingSession: true // Mark as part of voting session
       });
 
+      // Update user voted positions
       transaction.update(userRef, {
         votedPositions: admin.firestore.FieldValue.arrayUnion(position),
         lastVoteTimestamp: admin.firestore.Timestamp.now(),
@@ -478,7 +341,8 @@ app.post('/api/vote', verifySession, async (req, res) => {
 
     res.status(200).json({ 
       message: 'Vote submitted successfully',
-      position: position
+      position: position,
+      counted: true
     });
 
   } catch (error) {
@@ -487,6 +351,66 @@ app.post('/api/vote', verifySession, async (req, res) => {
       error: 'Failed to submit vote', 
       details: error.message 
     });
+  }
+});
+
+// Complete Voting endpoint - Store IP only when ALL positions are done
+app.post('/api/complete-voting', verifySession, async (req, res) => {
+  const { institutionalEmail } = req.body;
+
+  try {
+    // Check if user has voted for all positions
+    const userDoc = await db.collection('Users').doc(req.userId).get();
+    if (!userDoc.exists) {
+      return res.status(400).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const positions = await db.collection('Candidates').get();
+    const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
+
+    // Check if user has completed all positions
+    if (!userData.votedPositions || userData.votedPositions.length < allPositions.length) {
+      return res.status(400).json({ error: 'You have not completed voting for all positions' });
+    }
+
+    // Check if IP has already completed voting
+    const ipHasCompleted = await checkIPCompletedVoting(req.clientIp);
+    if (ipHasCompleted) {
+      console.log('🚫 IP already completed voting - invalidating all votes');
+      
+      // Invalidate all votes from this IP
+      const votesSnapshot = await db.collection('Votes')
+        .where('ipAddress', '==', req.clientIp)
+        .get();
+
+      const batch = db.batch();
+      votesSnapshot.docs.forEach(doc => {
+        batch.update(doc.ref, {
+          isValid: false,
+          isDuplicateIP: true,
+          invalidatedAt: admin.firestore.Timestamp.now()
+        });
+      });
+      await batch.commit();
+
+      return res.status(400).json({ 
+        error: 'This IP address has already been used to complete voting. All votes from this IP have been invalidated.',
+        duplicateIP: true
+      });
+    }
+
+    // Store IP as completed voting
+    await storeIPAsCompleted(req.clientIp, institutionalEmail);
+
+    res.status(200).json({ 
+      message: 'Voting completed successfully! Thank you for voting.',
+      completed: true
+    });
+
+  } catch (error) {
+    console.error('Complete voting error:', error);
+    res.status(500).json({ error: 'Failed to complete voting' });
   }
 });
 
@@ -523,38 +447,53 @@ app.get('/api/candidates/:position', async (req, res) => {
   }
 });
 
-// Public results
+// Public results - ONLY COUNT VALID VOTES
 app.get('/api/public/votes', async (req, res) => {
   try {
     const candidates = await db.collection('Candidates').get();
     const votes = await db.collection('Votes').get();
     
     const voteCounts = {};
-    const totalVotes = votes.size;
+    let totalValidVotes = 0;
+    let totalInvalidVotes = 0;
     
+    // Initialize positions with candidates
     candidates.docs.forEach(candidateDoc => {
       const { name, position } = candidateDoc.data();
       if (!voteCounts[position]) voteCounts[position] = [];
       voteCounts[position].push({ name, votes: 0 });
     });
     
+    // Count only valid votes (isValid !== false)
     votes.docs.forEach(vote => {
-      const { candidateId, position } = vote.data();
-      const candidateDoc = candidates.docs.find(c => c.id === candidateId);
-      if (candidateDoc && candidateDoc.data().position === position) {
-        const { name } = candidateDoc.data();
-        const candidateInPosition = voteCounts[position].find(c => c.name === name);
-        if (candidateInPosition) candidateInPosition.votes += 1;
+      const voteData = vote.data();
+      const { candidateId, position, isValid } = voteData;
+      
+      if (isValid !== false) {
+        const candidateDoc = candidates.docs.find(c => c.id === candidateId);
+        if (candidateDoc && candidateDoc.data().position === position) {
+          const { name } = candidateDoc.data();
+          const candidateInPosition = voteCounts[position].find(c => c.name === name);
+          if (candidateInPosition) {
+            candidateInPosition.votes += 1;
+            totalValidVotes++;
+          }
+        }
+      } else {
+        totalInvalidVotes++;
       }
     });
     
+    // Sort by votes descending
     Object.keys(voteCounts).forEach(position => {
       voteCounts[position].sort((a, b) => b.votes - a.votes);
     });
     
     res.status(200).json({
       voteCounts,
-      totalVotes,
+      totalValidVotes,
+      totalInvalidVotes,
+      totalVotes: votes.size,
       lastUpdated: new Date().toISOString()
     });
     
@@ -575,26 +514,12 @@ app.get('/api/dev/votes-table', async (req, res) => {
       const candidateDoc = candidatesSnapshot.docs.find(c => c.id === voteData.candidateId);
       const userDoc = usersSnapshot.docs.find(u => u.id === voteData.userId);
       
-      // Handle Firebase timestamp properly
-      let timestampValue = voteData.timestamp;
       let formattedTimestamp = 'N/A';
-      let isoString = 'N/A';
-      
-      if (timestampValue) {
-        // Convert Firebase Timestamp to JavaScript Date
-        if (timestampValue.toDate) {
-          const date = timestampValue.toDate();
-          formattedTimestamp = date.toLocaleString();
-          isoString = date.toISOString();
-        } else if (timestampValue._seconds) {
-          // Handle Firebase Timestamp structure
-          const date = new Date(timestampValue._seconds * 1000);
-          formattedTimestamp = date.toLocaleString();
-          isoString = date.toISOString();
-        } else if (typeof timestampValue === 'string') {
-          const date = new Date(timestampValue);
-          formattedTimestamp = date.toLocaleString();
-          isoString = date.toISOString();
+      if (voteData.timestamp) {
+        if (voteData.timestamp.toDate) {
+          formattedTimestamp = voteData.timestamp.toDate().toLocaleString();
+        } else if (voteData.timestamp._seconds) {
+          formattedTimestamp = new Date(voteData.timestamp._seconds * 1000).toLocaleString();
         }
       }
       
@@ -604,21 +529,25 @@ app.get('/api/dev/votes-table', async (req, res) => {
         position: voteData.position,
         candidateName: candidateDoc ? candidateDoc.data().name : 'Unknown Candidate',
         timestamp: formattedTimestamp,
-        rawTimestamp: isoString,
-        firebaseTimestamp: timestampValue
+        ipAddress: voteData.ipAddress,
+        isValid: voteData.isValid !== false,
+        isDuplicateIP: voteData.isDuplicateIP || false,
+        status: voteData.isValid === false ? 'INVALID (Duplicate IP)' : 'VALID'
       };
     });
     
-    // Sort by timestamp descending (newest first)
+    // Sort by timestamp descending
     voteList.sort((a, b) => {
-      const timeA = new Date(a.rawTimestamp);
-      const timeB = new Date(b.rawTimestamp);
+      const timeA = new Date(a.timestamp);
+      const timeB = new Date(b.timestamp);
       return timeB - timeA;
     });
     
     res.status(200).json({
       votes: voteList,
       totalVotes: voteList.length,
+      validVotes: voteList.filter(v => v.isValid).length,
+      invalidVotes: voteList.filter(v => !v.isValid).length,
       lastUpdated: new Date().toISOString()
     });
     
@@ -626,63 +555,6 @@ app.get('/api/dev/votes-table', async (req, res) => {
     console.error('Error fetching votes table:', error);
     res.status(500).json({ error: 'Failed to fetch votes table' });
   }
-});
-
-// Device analytics endpoint
-app.get('/api/admin/device-analytics', async (req, res) => {
-  try {
-    const users = await db.collection('Users').get();
-    const deviceStats = {
-      totalUsers: users.size,
-      uniqueIPs: new Set(),
-      uniqueDevices: new Set(),
-      devicesPerIP: {},
-      ipNetworks: {}
-    };
-
-    users.docs.forEach(doc => {
-      const userData = doc.data();
-      deviceStats.uniqueIPs.add(userData.ipAddress);
-      
-      if (userData.deviceFingerprint) {
-        deviceStats.uniqueDevices.add(userData.deviceFingerprint.hash);
-        
-        // Track devices per IP
-        if (!deviceStats.devicesPerIP[userData.ipAddress]) {
-          deviceStats.devicesPerIP[userData.ipAddress] = new Set();
-        }
-        deviceStats.devicesPerIP[userData.ipAddress].add(userData.deviceFingerprint.hash);
-      }
-    });
-
-    res.json({
-      totalUsers: deviceStats.totalUsers,
-      uniqueIPs: Array.from(deviceStats.uniqueIPs),
-      uniqueDevices: Array.from(deviceStats.uniqueDevices),
-      devicesPerIP: Object.keys(deviceStats.devicesPerIP).reduce((acc, ip) => {
-        acc[ip] = Array.from(deviceStats.devicesPerIP[ip]);
-        return acc;
-      }, {})
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to get device analytics' });
-  }
-});
-
-// Debug endpoint to check current IP and fingerprint
-app.get('/api/debug/device-info', (req, res) => {
-  const fingerprint = generateDeviceFingerprint(req);
-  res.json({
-    clientIp: req.clientIp,
-    deviceFingerprint: fingerprint,
-    headers: {
-      'user-agent': req.headers['user-agent'],
-      'accept': req.headers['accept'],
-      'accept-language': req.headers['accept-language'],
-      'sec-ch-ua': req.headers['sec-ch-ua'],
-      'sec-ch-ua-platform': req.headers['sec-ch-ua-platform']
-    }
-  });
 });
 
 // Health check endpoint
