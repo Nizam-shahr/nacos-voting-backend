@@ -60,7 +60,10 @@ const generateDeviceFingerprint = (req) => {
     acceptEncoding: req.headers['accept-encoding'] || 'unknown',
     sec_ch_ua: req.headers['sec-ch-ua'] || 'unknown',
     sec_ch_ua_platform: req.headers['sec-ch-ua-platform'] || 'unknown',
-    sec_ch_ua_mobile: req.headers['sec-ch-ua-mobile'] || 'unknown'
+    sec_ch_ua_mobile: req.headers['sec-ch-ua-mobile'] || 'unknown',
+    // Add more unique identifiers
+    connection: req.headers['connection'] || 'unknown',
+    cacheControl: req.headers['cache-control'] || 'unknown'
   };
 
   // Create a hash of the fingerprint data
@@ -69,7 +72,7 @@ const generateDeviceFingerprint = (req) => {
   
   console.log('🔍 Device Fingerprint:', {
     hash: fingerprintHash,
-    data: fingerprintData,
+    userAgent: fingerprintData.userAgent, // Log this specifically
     ip: req.clientIp
   });
   
@@ -80,11 +83,38 @@ const generateDeviceFingerprint = (req) => {
   };
 };
 
-// STRICT Device checking - IP + Fingerprint
-const checkDeviceUsed = async (ipAddress, fingerprint) => {
+// STRICT Device checking - IP + Fingerprint with non-browser detection
+const checkDeviceUsed = async (ipAddress, fingerprint, userAgent) => {
   try {
-    console.log('🔍 STRICT Device Check:', { ip: ipAddress, fingerprint: fingerprint.hash });
+    console.log('🔍 STRICT Device Check:', { 
+      ip: ipAddress, 
+      fingerprint: fingerprint.hash,
+      userAgent: userAgent 
+    });
     
+    // If it's a non-browser request (testing tools), use IP-only checking
+    if (userAgent.includes('node') || userAgent.includes('Postman') || userAgent.includes('curl')) {
+      console.log('⚠️  Non-browser request - using IP-only checking');
+      const users = await db.collection('Users').get();
+      let ipFound = false;
+      let foundUserEmail = '';
+
+      users.docs.forEach(doc => {
+        const userData = doc.data();
+        if (userData.ipAddress === ipAddress) {
+          ipFound = true;
+          foundUserEmail = userData.institutionalEmail;
+        }
+      });
+
+      return { 
+        deviceFound: ipFound, 
+        foundUserEmail, 
+        matchType: ipFound ? 'SAME_NETWORK' : '' 
+      };
+    }
+
+    // Normal browser fingerprinting for real users
     const users = await db.collection('Users').get();
     let deviceFound = false;
     let foundUserEmail = '';
@@ -250,43 +280,12 @@ app.post('/api/sign-in', async (req, res) => {
     const deviceFingerprint = generateDeviceFingerprint(req);
     
     // STEP 1: STRICT Device Check (IP + Fingerprint)
-    const { deviceFound, foundUserEmail, matchType } = await checkDeviceUsed(req.clientIp, deviceFingerprint);
+    const { deviceFound, foundUserEmail, matchType } = await checkDeviceUsed(req.clientIp, deviceFingerprint, req.headers['user-agent'] || '');
     
     if (deviceFound) {
-      let errorMessage = '';
-      
-      switch(matchType) {
-        case 'EXACT_DEVICE':
-          errorMessage = `🚫 THIS EXACT DEVICE HAS ALREADY VOTED 🚫
-
-This specific phone/computer was already used by: ${foundUserEmail}
-
-You cannot vote again from this same device, even with different credentials.`;
-          break;
-          
-        case 'SAME_NETWORK':
-          errorMessage = `🚫 THIS NETWORK HAS ALREADY BEEN USED 🚫
-
-This internet connection (WiFi/network) was already used by: ${foundUserEmail}
-
-💡 SOLUTION: Turn off WiFi and use your MOBILE DATA`;
-          break;
-          
-        case 'SAME_DEVICE_DIFFERENT_NETWORK':
-          errorMessage = `🚫 THIS DEVICE HAS ALREADY VOTED 🚫
-
-This phone/computer was used from a different network by: ${foundUserEmail}
-
-You need to use a completely different device to vote.`;
-          break;
-          
-        default:
-          errorMessage = `This device/network has already been used by: ${foundUserEmail}`;
-      }
-      
       console.log('🚫 Device blocked - Type:', matchType, 'User:', foundUserEmail);
       return res.status(400).json({ 
-        error: errorMessage,
+        error: "Can't sign-in/vote twice. You have already voted.",
         deviceBlocked: true,
         blockType: matchType
       });
@@ -298,7 +297,7 @@ You need to use a completely different device to vote.`;
     if (duplicateFound) {
       console.log('🚫 DUPLICATE PERSONAL EMAIL - Already used by:', duplicateEmail);
       return res.status(400).json({ 
-        error: `This personal email (${normalizedPersonalEmail}) has already been used by another student (${duplicateEmail}). Each student must use their own unique personal email address.`,
+        error: "Can't sign-in/vote twice. You have already voted.",
         emailBlocked: true 
       });
     }
@@ -313,11 +312,56 @@ You need to use a completely different device to vote.`;
     let sessionToken = generateSessionToken();
 
     if (!userDocs.empty) {
-      // EXISTING USER - But device is already blocked above, so this should rarely happen
-      console.log('❌ Existing user but device already blocked');
-      return res.status(400).json({ 
-        error: 'Your account exists but this device/network has already been used by another student. Please use a different device and network.',
-        deviceBlocked: true 
+      userId = userDocs.docs[0].id;
+      userData = userDocs.docs[0].data();
+      
+      // Check if this existing user's IP matches current IP
+      const existingUserIp = userData.ipAddress;
+      if (existingUserIp && existingUserIp.includes(req.clientIp)) {
+        console.log('User exists with same IP - allowing continuation');
+      } else {
+        // User exists but with different IP - BLOCK
+        console.log('User exists with different IP - BLOCKING:', existingUserIp, 'vs', req.clientIp);
+        return res.status(400).json({ 
+          error: "Can't sign-in/vote twice. You have already voted.",
+          ipBlocked: true 
+        });
+      }
+      
+      const positions = await db.collection('Candidates').get();
+      const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
+      
+      if (userData.votedPositions && userData.votedPositions.length >= allPositions.length) {
+        return res.status(400).json({ 
+          error: 'You have already completed voting for all positions',
+          alreadyVoted: true 
+        });
+      }
+      
+      const updateData = {
+        lastSignIn: admin.firestore.Timestamp.now(),
+        lastIp: req.clientIp,
+        sessionToken: sessionToken,
+        sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
+        personalEmail: normalizedPersonalEmail,
+        fullName: normalizedName
+      };
+
+      await db.collection('Users').doc(userId).update(updateData);
+
+      const remainingPositions = allPositions.filter(pos => 
+        !userData.votedPositions?.includes(pos)
+      );
+      
+      return res.status(200).json({ 
+        message: 'Sign-in successful', 
+        institutionalEmail: normalizedInstitutionalEmail,
+        personalEmail: normalizedPersonalEmail,
+        matricNumber: normalizedMatric,
+        fullName: normalizedName,
+        remainingPositions,
+        sessionToken,
+        continueVoting: true
       });
     }
 
