@@ -13,21 +13,11 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// Rate limiting
-const voteLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 3,
-  message: 'Too many voting attempts from this IP, please try again later.'
-});
-
-const signInLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: 'Too many sign-in attempts from this IP, please try again later.'
-});
-
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 
 // IP address tracking
@@ -42,54 +32,30 @@ app.use((req, res, next) => {
   next();
 });
 
+// Rate limiting only for sign-in
+const signInLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 sign-in attempts per windowMs
+  message: { error: 'Too many sign-in attempts, please try again later.' }
+});
+
 // Generate session token
 const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
-// Function to validate name-email consistency
-const validateNameEmailConsistency = (fullName, personalEmail) => {
-  const normalizedName = fullName.toLowerCase().trim();
-  const normalizedEmail = personalEmail.toLowerCase().trim();
-  
-  // Extract name parts
-  const nameParts = normalizedName.split(' ').filter(part => part.length > 1);
-  
-  if (nameParts.length < 2) {
-    return { valid: false, error: 'Full name must include both first and last name' };
+// Check if IP has already signed in
+const checkIPSignedIn = async (ipAddress) => {
+  try {
+    const users = await db.collection('Users')
+      .where('ipAddress', '==', ipAddress)
+      .get();
+
+    return !users.empty;
+  } catch (error) {
+    console.error('Error checking IP sign-ins:', error);
+    return false;
   }
-  
-  const firstName = nameParts[0];
-  const lastName = nameParts[nameParts.length - 1];
-  
-  // Check if email contains parts of the name
-  const emailLocalPart = normalizedEmail.split('@')[0];
-  
-  // Common email patterns to check
-  const patterns = [
-    firstName + '.' + lastName,
-    firstName + lastName,
-    firstName.charAt(0) + lastName,
-    firstName + '.' + lastName.charAt(0),
-    firstName + '_' + lastName,
-    lastName + '.' + firstName,
-    firstName,
-    lastName
-  ];
-  
-  // Check if email matches any common pattern with the name
-  const matchesPattern = patterns.some(pattern => 
-    emailLocalPart.includes(pattern.toLowerCase())
-  );
-  
-  if (!matchesPattern) {
-    return { 
-      valid: false, 
-      error: 'Personal email should be consistent with your full name (e.g., john.doe@gmail.com for John Doe)' 
-    };
-  }
-  
-  return { valid: true };
 };
 
 // Session verification middleware
@@ -119,6 +85,7 @@ const verifySession = async (req, res, next) => {
   }
 };
 
+// Enhanced Sign In with IP restriction - No multiple sign-ins from same IP
 app.post('/api/sign-in', signInLimiter, async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
@@ -175,6 +142,15 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
   const normalizedName = fullName.trim();
 
   try {
+    // Check if IP has already signed in (prevent multiple sign-ins from same IP)
+    const ipHasSignedIn = await checkIPSignedIn(req.clientIp);
+    if (ipHasSignedIn) {
+      return res.status(400).json({ 
+        error: 'This IP address has already been used for signing in. Each IP can only sign in once.',
+        ipBlocked: true 
+      });
+    }
+
     const userDocs = await db.collection('Users')
       .where('institutionalEmail', '==', normalizedInstitutionalEmail)
       .get();
@@ -202,8 +178,8 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
         lastIp: req.clientIp,
         sessionToken: sessionToken,
         sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
-        personalEmail: normalizedPersonalEmail, // Always update personal email
-        fullName: normalizedName // Update name if changed
+        personalEmail: normalizedPersonalEmail,
+        fullName: normalizedName
       };
 
       await db.collection('Users').doc(userId).update(updateData);
@@ -233,7 +209,7 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
       matricNumber: normalizedMatric,
       fullName: normalizedName,
       votedPositions: [],
-      ipAddress: req.clientIp,
+      ipAddress: req.clientIp, // Store IP during sign-in
       sessionToken: sessionToken,
       sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
       signInTimestamp: admin.firestore.Timestamp.now(),
@@ -259,14 +235,14 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Sign-in error:', error);
     res.status(500).json({ error: 'Sign-in failed' });
   }
 });
 
-// Vote endpoint
-app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
+// Vote endpoint - NO RATE LIMITING, just session verification
+app.post('/api/vote', verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
-  const ipAddress = req.clientIp;
 
   if (!candidateId || !position) {
     return res.status(400).json({ error: 'Missing required fields' });
@@ -299,23 +275,14 @@ app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
         throw new Error('Candidate position mismatch');
       }
 
-      const recentVotes = await transaction.get(
-        db.collection('Votes')
-          .where('ipAddress', '==', ipAddress)
-          .where('timestamp', '>', admin.firestore.Timestamp.fromDate(new Date(Date.now() - 3600000)))
-      );
-
-      if (recentVotes.size > 2) {
-        throw new Error('Too many votes from this IP address recently');
-      }
-
+      // Record the vote
       const voteRef = db.collection('Votes').doc();
       transaction.set(voteRef, {
         candidateId,
         userId: req.userId,
         userInstitutionalEmail: normalizedInstitutionalEmail,
         position,
-        ipAddress,
+        ipAddress: req.clientIp,
         timestamp: admin.firestore.Timestamp.now(),
         userAgent: req.headers['user-agent']
       });
@@ -323,7 +290,7 @@ app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
       transaction.update(userRef, {
         votedPositions: admin.firestore.FieldValue.arrayUnion(position),
         lastVoteTimestamp: admin.firestore.Timestamp.now(),
-        lastVoteIp: ipAddress,
+        lastVoteIp: req.clientIp,
         totalVotes: (userData.totalVotes || 0) + 1
       });
     });
@@ -334,6 +301,7 @@ app.post('/api/vote', voteLimiter, verifySession, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Vote error:', error);
     res.status(400).json({ 
       error: 'Failed to submit vote', 
       details: error.message 
@@ -414,27 +382,58 @@ app.get('/api/public/votes', async (req, res) => {
   }
 });
 
-// Development votes table
+
+// Add this to your server.js - Updated votes table endpoint
+// Updated votes table endpoint with proper timestamp handling
 app.get('/api/dev/votes-table', async (req, res) => {
   try {
-    const votes = await db.collection('Votes').get();
-    const candidates = await db.collection('Candidates').get();
+    const votesSnapshot = await db.collection('Votes').get();
+    const candidatesSnapshot = await db.collection('Candidates').get();
+    const usersSnapshot = await db.collection('Users').get();
     
-    const voteList = votes.docs.map(doc => {
+    const voteList = votesSnapshot.docs.map(doc => {
       const voteData = doc.data();
-      const candidate = candidates.docs.find(c => c.id === voteData.candidateId);
+      const candidateDoc = candidatesSnapshot.docs.find(c => c.id === voteData.candidateId);
+      const userDoc = usersSnapshot.docs.find(u => u.id === voteData.userId);
+      
+      // Handle Firebase timestamp properly
+      let timestampValue = voteData.timestamp;
+      let formattedTimestamp = 'N/A';
+      let isoString = 'N/A';
+      
+      if (timestampValue) {
+        // Convert Firebase Timestamp to JavaScript Date
+        if (timestampValue.toDate) {
+          const date = timestampValue.toDate();
+          formattedTimestamp = date.toLocaleString();
+          isoString = date.toISOString();
+        } else if (timestampValue._seconds) {
+          // Handle Firebase Timestamp structure
+          const date = new Date(timestampValue._seconds * 1000);
+          formattedTimestamp = date.toLocaleString();
+          isoString = date.toISOString();
+        } else if (typeof timestampValue === 'string') {
+          const date = new Date(timestampValue);
+          formattedTimestamp = date.toLocaleString();
+          isoString = date.toISOString();
+        }
+      }
       
       return {
         id: doc.id,
+        userInstitutionalEmail: voteData.userInstitutionalEmail || (userDoc ? userDoc.data().institutionalEmail : 'Unknown'),
         position: voteData.position,
-        candidateName: candidate ? candidate.data().name : 'Unknown',
-        timestamp: voteData.timestamp,
+        candidateName: candidateDoc ? candidateDoc.data().name : 'Unknown Candidate',
+        timestamp: formattedTimestamp,
+        rawTimestamp: isoString,
+        firebaseTimestamp: timestampValue // Keep original for reference
       };
     });
     
+    // Sort by timestamp descending (newest first)
     voteList.sort((a, b) => {
-      const timeA = a.timestamp?.toDate?.() || new Date(a.timestamp);
-      const timeB = b.timestamp?.toDate?.() || new Date(b.timestamp);
+      const timeA = new Date(a.rawTimestamp);
+      const timeB = new Date(b.rawTimestamp);
       return timeB - timeA;
     });
     
@@ -445,8 +444,17 @@ app.get('/api/dev/votes-table', async (req, res) => {
     });
     
   } catch (error) {
+    console.error('Error fetching votes table:', error);
     res.status(500).json({ error: 'Failed to fetch votes table' });
   }
+});
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 const PORT = process.env.PORT || 5000;
