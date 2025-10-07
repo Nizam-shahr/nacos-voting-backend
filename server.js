@@ -1,7 +1,6 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
@@ -32,19 +31,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting only for sign-in
-const signInLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 sign-in attempts per windowMs
-  message: { error: 'Too many sign-in attempts, please try again later.' }
-});
-
 // Generate session token
 const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
-// Check if IP has already signed in
+// Check if IP has already signed in (NEW: Only check IP, no time limits)
 const checkIPSignedIn = async (ipAddress) => {
   try {
     const users = await db.collection('Users')
@@ -85,8 +77,8 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Enhanced Sign In with IP restriction - No multiple sign-ins from same IP
-app.post('/api/sign-in', signInLimiter, async (req, res) => {
+// Enhanced Sign In with IP restriction - No rate limits, only IP tracking
+app.post('/api/sign-in', async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
   if (!institutionalEmail || !matricNumber || !fullName || !personalEmail) {
@@ -146,7 +138,7 @@ app.post('/api/sign-in', signInLimiter, async (req, res) => {
     const ipHasSignedIn = await checkIPSignedIn(req.clientIp);
     if (ipHasSignedIn) {
       return res.status(400).json({ 
-        error: 'This IP address has already been used for signing in. Each IP can only sign in once.',
+        error: 'This IP address has already been used for signing in. Each IP can only be used once for the entire election period.',
         ipBlocked: true 
       });
     }
@@ -382,9 +374,7 @@ app.get('/api/public/votes', async (req, res) => {
   }
 });
 
-
-// Add this to your server.js - Updated votes table endpoint
-// Updated votes table endpoint with proper timestamp handling
+// Development votes table
 app.get('/api/dev/votes-table', async (req, res) => {
   try {
     const votesSnapshot = await db.collection('Votes').get();
@@ -448,6 +438,7 @@ app.get('/api/dev/votes-table', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch votes table' });
   }
 });
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.status(200).json({ 
