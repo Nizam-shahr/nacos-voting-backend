@@ -19,15 +19,23 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// IP address tracking
+// Improved IP address tracking - Extract only the client IP
 app.use((req, res, next) => {
   let clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   
+  // Handle multiple IPs in x-forwarded-for (common with proxies)
+  if (clientIp && clientIp.includes(',')) {
+    // Take the first IP which is the original client IP
+    clientIp = clientIp.split(',')[0].trim();
+  }
+  
+  // Remove IPv6 prefix if present
   if (clientIp && clientIp.startsWith('::ffff:')) {
     clientIp = clientIp.substring(7);
   }
   
   req.clientIp = clientIp;
+  console.log('Extracted client IP:', clientIp); // For debugging
   next();
 });
 
@@ -36,14 +44,36 @@ const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 };
 
-// Check if IP has already signed in (NEW: Only check IP, no time limits)
+// Improved IP checking - Only check the actual client IP
 const checkIPSignedIn = async (ipAddress) => {
   try {
-    const users = await db.collection('Users')
-      .where('ipAddress', '==', ipAddress)
-      .get();
-
-    return !users.empty;
+    console.log('Checking IP in database:', ipAddress);
+    
+    const users = await db.collection('Users').get();
+    let ipFound = false;
+    
+    // Check all users for this IP
+    users.docs.forEach(doc => {
+      const userData = doc.data();
+      const storedIp = userData.ipAddress;
+      
+      // Handle both single IP and comma-separated IPs
+      if (storedIp) {
+        if (storedIp.includes(',')) {
+          // If stored as multiple IPs, check each one
+          const ipList = storedIp.split(',').map(ip => ip.trim());
+          if (ipList.includes(ipAddress)) {
+            ipFound = true;
+            console.log('IP found in existing user:', userData.institutionalEmail);
+          }
+        } else if (storedIp === ipAddress) {
+          ipFound = true;
+          console.log('IP found in existing user:', userData.institutionalEmail);
+        }
+      }
+    });
+    
+    return ipFound;
   } catch (error) {
     console.error('Error checking IP sign-ins:', error);
     return false;
@@ -77,7 +107,7 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Enhanced Sign In with IP restriction - No rate limits, only IP tracking
+// Enhanced Sign In with STRICT IP restriction
 app.post('/api/sign-in', async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
@@ -134,11 +164,12 @@ app.post('/api/sign-in', async (req, res) => {
   const normalizedName = fullName.trim();
 
   try {
-    // Check if IP has already signed in (prevent multiple sign-ins from same IP)
+    // STRICT IP CHECKING - Check if IP has already signed in
     const ipHasSignedIn = await checkIPSignedIn(req.clientIp);
     if (ipHasSignedIn) {
+      console.log('IP BLOCKED - Already used:', req.clientIp);
       return res.status(400).json({ 
-        error: 'This IP address has already been used for signing in. Each IP can only be used once for the entire election period.',
+        error: 'This device/network has already been used for voting. Each device/network can only be used once for the entire election period. Please use a different device or network.',
         ipBlocked: true 
       });
     }
@@ -155,6 +186,19 @@ app.post('/api/sign-in', async (req, res) => {
       userId = userDocs.docs[0].id;
       userData = userDocs.docs[0].data();
       
+      // Check if this existing user's IP matches current IP
+      const existingUserIp = userData.ipAddress;
+      if (existingUserIp && existingUserIp.includes(req.clientIp)) {
+        console.log('User exists with same IP - allowing continuation');
+      } else {
+        // User exists but with different IP - BLOCK
+        console.log('User exists with different IP - BLOCKING:', existingUserIp, 'vs', req.clientIp);
+        return res.status(400).json({ 
+          error: 'This student account has already been used from a different device/network. Each student can only vote once.',
+          ipBlocked: true 
+        });
+      }
+      
       const positions = await db.collection('Candidates').get();
       const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
       
@@ -167,7 +211,7 @@ app.post('/api/sign-in', async (req, res) => {
       
       const updateData = {
         lastSignIn: admin.firestore.Timestamp.now(),
-        lastIp: req.clientIp,
+        lastIp: req.clientIp, // Store only the client IP
         sessionToken: sessionToken,
         sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
         personalEmail: normalizedPersonalEmail,
@@ -192,6 +236,7 @@ app.post('/api/sign-in', async (req, res) => {
       });
     }
 
+    // NEW USER - Create with strict IP tracking
     const newUserRef = db.collection('Users').doc();
     userId = newUserRef.id;
 
@@ -201,7 +246,7 @@ app.post('/api/sign-in', async (req, res) => {
       matricNumber: normalizedMatric,
       fullName: normalizedName,
       votedPositions: [],
-      ipAddress: req.clientIp, // Store IP during sign-in
+      ipAddress: req.clientIp, // Store ONLY the client IP
       sessionToken: sessionToken,
       sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
       signInTimestamp: admin.firestore.Timestamp.now(),
@@ -232,7 +277,7 @@ app.post('/api/sign-in', async (req, res) => {
   }
 });
 
-// Vote endpoint - NO RATE LIMITING, just session verification
+// Vote endpoint - Also check IP during voting
 app.post('/api/vote', verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
 
@@ -243,6 +288,27 @@ app.post('/api/vote', verifySession, async (req, res) => {
   const normalizedInstitutionalEmail = institutionalEmail.toLowerCase();
 
   try {
+    // Additional IP check during voting
+    const ipHasSignedIn = await checkIPSignedIn(req.clientIp);
+    if (ipHasSignedIn) {
+      // Check if this IP belongs to the current user
+      const userDocs = await db.collection('Users')
+        .where('institutionalEmail', '==', normalizedInstitutionalEmail)
+        .get();
+      
+      if (!userDocs.empty) {
+        const userData = userDocs.docs[0].data();
+        const userIp = userData.ipAddress;
+        
+        if (!userIp || !userIp.includes(req.clientIp)) {
+          return res.status(400).json({ 
+            error: 'Security violation: IP address mismatch. Please sign in again.',
+            ipBlocked: true 
+          });
+        }
+      }
+    }
+
     await db.runTransaction(async (transaction) => {
       const userRef = db.collection('Users').doc(req.userId);
       const userDoc = await transaction.get(userRef);
@@ -274,7 +340,7 @@ app.post('/api/vote', verifySession, async (req, res) => {
         userId: req.userId,
         userInstitutionalEmail: normalizedInstitutionalEmail,
         position,
-        ipAddress: req.clientIp,
+        ipAddress: req.clientIp, // Store only client IP
         timestamp: admin.firestore.Timestamp.now(),
         userAgent: req.headers['user-agent']
       });
@@ -282,7 +348,7 @@ app.post('/api/vote', verifySession, async (req, res) => {
       transaction.update(userRef, {
         votedPositions: admin.firestore.FieldValue.arrayUnion(position),
         lastVoteTimestamp: admin.firestore.Timestamp.now(),
-        lastVoteIp: req.clientIp,
+        lastVoteIp: req.clientIp, // Store only client IP
         totalVotes: (userData.totalVotes || 0) + 1
       });
     });
