@@ -61,7 +61,6 @@ const generateDeviceFingerprint = (req) => {
     sec_ch_ua: req.headers['sec-ch-ua'] || 'unknown',
     sec_ch_ua_platform: req.headers['sec-ch-ua-platform'] || 'unknown',
     sec_ch_ua_mobile: req.headers['sec-ch-ua-mobile'] || 'unknown',
-    // Add more unique identifiers
     connection: req.headers['connection'] || 'unknown',
     cacheControl: req.headers['cache-control'] || 'unknown'
   };
@@ -72,7 +71,7 @@ const generateDeviceFingerprint = (req) => {
   
   console.log('🔍 Device Fingerprint:', {
     hash: fingerprintHash,
-    userAgent: fingerprintData.userAgent, // Log this specifically
+    userAgent: fingerprintData.userAgent,
     ip: req.clientIp
   });
   
@@ -83,78 +82,89 @@ const generateDeviceFingerprint = (req) => {
   };
 };
 
-// STRICT Device checking - IP + Fingerprint with non-browser detection
-const checkDeviceUsed = async (ipAddress, fingerprint, userAgent) => {
+// Store device fingerprint in database
+const storeDeviceFingerprint = async (fingerprint, institutionalEmail) => {
   try {
-    console.log('🔍 STRICT Device Check:', { 
-      ip: ipAddress, 
-      fingerprint: fingerprint.hash,
-      userAgent: userAgent 
+    const fingerprintRef = db.collection('DeviceFingerprints').doc();
+    await fingerprintRef.set({
+      fingerprintHash: fingerprint.hash,
+      ipAddress: fingerprint.data.ip || 'unknown',
+      userAgent: fingerprint.data.userAgent,
+      institutionalEmail: institutionalEmail,
+      combined: fingerprint.combined,
+      timestamp: admin.firestore.Timestamp.now(),
+      data: fingerprint.data
     });
+    console.log('✅ Device fingerprint stored in database');
+  } catch (error) {
+    console.error('Error storing fingerprint:', error);
+  }
+};
+
+// Check if device fingerprint exists in database
+const checkDeviceFingerprint = async (fingerprint) => {
+  try {
+    console.log('🔍 Checking device fingerprint in database:', fingerprint.hash);
     
-    // If it's a non-browser request (testing tools), use IP-only checking
-    if (userAgent.includes('node') || userAgent.includes('Postman') || userAgent.includes('curl')) {
-      console.log('⚠️  Non-browser request - using IP-only checking');
-      const users = await db.collection('Users').get();
-      let ipFound = false;
-      let foundUserEmail = '';
+    // Check by combined fingerprint (IP + Hash)
+    const combinedQuery = await db.collection('DeviceFingerprints')
+      .where('combined', '==', fingerprint.combined)
+      .get();
 
-      users.docs.forEach(doc => {
-        const userData = doc.data();
-        if (userData.ipAddress === ipAddress) {
-          ipFound = true;
-          foundUserEmail = userData.institutionalEmail;
-        }
-      });
-
-      return { 
-        deviceFound: ipFound, 
-        foundUserEmail, 
-        matchType: ipFound ? 'SAME_NETWORK' : '' 
+    if (!combinedQuery.empty) {
+      const doc = combinedQuery.docs[0];
+      console.log('🚫 Exact device match found in database:', doc.data().institutionalEmail);
+      return {
+        deviceFound: true,
+        foundUserEmail: doc.data().institutionalEmail,
+        matchType: 'EXACT_DEVICE'
       };
     }
 
-    // Normal browser fingerprinting for real users
-    const users = await db.collection('Users').get();
-    let deviceFound = false;
-    let foundUserEmail = '';
-    let matchType = '';
+    // Check by fingerprint hash only (same device, different network)
+    const hashQuery = await db.collection('DeviceFingerprints')
+      .where('fingerprintHash', '==', fingerprint.hash)
+      .get();
 
-    users.docs.forEach(doc => {
-      const userData = doc.data();
-      
-      // Check 1: Exact same device (IP + Fingerprint)
-      if (userData.deviceFingerprint && userData.deviceFingerprint.combined === fingerprint.combined) {
-        deviceFound = true;
-        foundUserEmail = userData.institutionalEmail;
-        matchType = 'EXACT_DEVICE';
-        console.log('🚫 Exact device match found:', foundUserEmail);
-        return;
-      }
-      
-      // Check 2: Same IP but different device
-      if (userData.ipAddress === ipAddress) {
-        deviceFound = true;
-        foundUserEmail = userData.institutionalEmail;
-        matchType = 'SAME_NETWORK';
-        console.log('🚫 Same network IP found:', foundUserEmail);
-        return;
-      }
-      
-      // Check 3: Same fingerprint but different IP (user switched networks)
-      if (userData.deviceFingerprint && userData.deviceFingerprint.hash === fingerprint.hash) {
-        deviceFound = true;
-        foundUserEmail = userData.institutionalEmail;
-        matchType = 'SAME_DEVICE_DIFFERENT_NETWORK';
-        console.log('🚫 Same device, different network:', foundUserEmail);
-        return;
-      }
-    });
+    if (!hashQuery.empty) {
+      const doc = hashQuery.docs[0];
+      console.log('🚫 Same device, different network found:', doc.data().institutionalEmail);
+      return {
+        deviceFound: true,
+        foundUserEmail: doc.data().institutionalEmail,
+        matchType: 'SAME_DEVICE_DIFFERENT_NETWORK'
+      };
+    }
 
-    return { deviceFound, foundUserEmail, matchType };
+    // Check by IP only (same network, different device)
+    const ipQuery = await db.collection('DeviceFingerprints')
+      .where('ipAddress', '==', fingerprint.data.ip || 'unknown')
+      .get();
+
+    if (!ipQuery.empty) {
+      const doc = ipQuery.docs[0];
+      console.log('🚫 Same network IP found:', doc.data().institutionalEmail);
+      return {
+        deviceFound: true,
+        foundUserEmail: doc.data().institutionalEmail,
+        matchType: 'SAME_NETWORK'
+      };
+    }
+
+    console.log('✅ No matching device fingerprint found in database');
+    return {
+      deviceFound: false,
+      foundUserEmail: '',
+      matchType: ''
+    };
+
   } catch (error) {
-    console.error('Error checking device:', error);
-    return { deviceFound: false, foundUserEmail: '', matchType: '' };
+    console.error('Error checking device fingerprint:', error);
+    return {
+      deviceFound: false,
+      foundUserEmail: '',
+      matchType: ''
+    };
   }
 };
 
@@ -170,7 +180,6 @@ const checkDuplicatePersonalEmail = async (personalEmail) => {
     users.docs.forEach(doc => {
       const userData = doc.data();
       
-      // Check if personal email matches ANY user
       if (userData.personalEmail && userData.personalEmail.toLowerCase() === personalEmail.toLowerCase()) {
         duplicateFound = true;
         duplicateEmail = userData.institutionalEmail;
@@ -217,7 +226,7 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Enhanced Sign In with STRICT IP + FINGERPRINT restriction
+// Enhanced Sign In with DATABASE-BASED fingerprint tracking
 app.post('/api/sign-in', async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
@@ -279,8 +288,8 @@ app.post('/api/sign-in', async (req, res) => {
     // Generate device fingerprint
     const deviceFingerprint = generateDeviceFingerprint(req);
     
-    // STEP 1: STRICT Device Check (IP + Fingerprint)
-    const { deviceFound, foundUserEmail, matchType } = await checkDeviceUsed(req.clientIp, deviceFingerprint, req.headers['user-agent'] || '');
+    // STEP 1: DATABASE-BASED Device Check
+    const { deviceFound, foundUserEmail, matchType } = await checkDeviceFingerprint(deviceFingerprint);
     
     if (deviceFound) {
       console.log('🚫 Device blocked - Type:', matchType, 'User:', foundUserEmail);
@@ -388,6 +397,9 @@ app.post('/api/sign-in', async (req, res) => {
     };
 
     await newUserRef.set(userData);
+
+    // STORE FINGERPRINT IN DATABASE (PERSISTENT)
+    await storeDeviceFingerprint(deviceFingerprint, normalizedInstitutionalEmail);
 
     const positions = await db.collection('Candidates').get();
     const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
