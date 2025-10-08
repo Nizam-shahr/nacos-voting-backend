@@ -19,23 +19,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// IP address tracking
-app.use((req, res, next) => {
-  let clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress || req.socket.remoteAddress;
-  
-  if (clientIp && clientIp.includes(',')) {
-    clientIp = clientIp.split(',')[0].trim();
-  }
-  
-  if (clientIp && clientIp.startsWith('::ffff:')) {
-    clientIp = clientIp.substring(7);
-  }
-
-  req.clientIp = clientIp;
-  console.log('Client IP:', clientIp);
-  next();
-});
-
 // Generate session token
 const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
@@ -58,15 +41,17 @@ const checkDuplicatePersonalEmail = async (personalEmail) => {
 
     return { duplicateFound, duplicateEmail };
   } catch (error) {
+    console.error('Error checking duplicate personal email:', error);
     return { duplicateFound: false, duplicateEmail: '' };
   }
 };
 
 // Session verification middleware
 const verifySession = async (req, res, next) => {
-  const { institutionalEmail, sessionToken } = req.body;
+  const { institutionalEmail, sessionToken, deviceId } = req.body;
   
-  if (!institutionalEmail || !sessionToken) {
+  if (!institutionalEmail || !sessionToken || !deviceId) {
+    console.log(`Session verification failed for ${institutionalEmail}: Missing fields`);
     return res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
   }
 
@@ -74,10 +59,12 @@ const verifySession = async (req, res, next) => {
     const userDocs = await db.collection('Users')
       .where('institutionalEmail', '==', institutionalEmail.toLowerCase())
       .where('sessionToken', '==', sessionToken)
+      .where('deviceId', '==', deviceId)
       .where('sessionExpiry', '>', admin.firestore.Timestamp.now())
       .get();
 
     if (userDocs.empty) {
+      console.log(`Session verification failed for ${institutionalEmail}: No valid session found`);
       return res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
     }
 
@@ -85,15 +72,16 @@ const verifySession = async (req, res, next) => {
     req.userId = userDocs.docs[0].id;
     next();
   } catch (error) {
+    console.error('Session verification error:', error);
     res.status(500).json({ error: 'Session verification failed' });
   }
 };
 
-// Sign In - No IP checking
+// Sign In - Validate deviceId
 app.post('/api/sign-in', async (req, res) => {
-  const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
+  const { institutionalEmail, personalEmail, matricNumber, fullName, deviceId } = req.body;
   
-  if (!institutionalEmail || !matricNumber || !fullName || !personalEmail) {
+  if (!institutionalEmail || !matricNumber || !fullName || !personalEmail || !deviceId) {
     return res.status(400).json({ error: 'All fields are required' });
   }
 
@@ -146,15 +134,30 @@ app.post('/api/sign-in', async (req, res) => {
   const normalizedName = fullName.trim();
 
   try {
-    console.log('🔄 Sign-in attempt from IP:', req.clientIp, 'for:', institutionalEmail);
+    console.log('🔄 Sign-in attempt for:', institutionalEmail, 'Device ID:', deviceId);
 
     // Check for duplicate personal email
     const { duplicateFound, duplicateEmail } = await checkDuplicatePersonalEmail(normalizedPersonalEmail);
     
     if (duplicateFound) {
+      console.log(`Duplicate personal email ${normalizedPersonalEmail} found for ${duplicateEmail}`);
       return res.status(400).json({ 
         error: "This personal email has already been used by another student.",
         emailBlocked: true 
+      });
+    }
+
+    // Check for duplicate deviceId
+    const deviceDocs = await db.collection('Users')
+      .where('deviceId', '==', deviceId)
+      .where('deviceId', '!=', null)
+      .get();
+
+    if (!deviceDocs.empty) {
+      console.log(`Duplicate device ID ${deviceId} found for ${normalizedInstitutionalEmail}`);
+      return res.status(400).json({ 
+        error: 'This device has already been used to vote.',
+        deviceBlocked: true 
       });
     }
 
@@ -175,7 +178,8 @@ app.post('/api/sign-in', async (req, res) => {
       const positions = await db.collection('Candidates').get();
       const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
       
-      if (userData.votedPositions && userData.votedPositions.length >= allPositions.length && userData.ipAddress) {
+      if (userData.votedPositions && userData.votedPositions.length >= allPositions.length && userData.voteTimestamp) {
+        console.log(`User ${normalizedInstitutionalEmail} has already completed voting`);
         return res.status(400).json({ 
           error: 'You have already completed voting for all positions',
           alreadyVoted: true 
@@ -184,11 +188,11 @@ app.post('/api/sign-in', async (req, res) => {
       
       const updateData = {
         lastSignIn: admin.firestore.Timestamp.now(),
-        lastIp: req.clientIp,
         sessionToken: sessionToken,
-        sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
+        sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 15 * 60 * 1000)), // 15 minutes
         personalEmail: normalizedPersonalEmail,
-        fullName: normalizedName
+        fullName: normalizedName,
+        deviceId: deviceId
       };
 
       await db.collection('Users').doc(userId).update(updateData);
@@ -220,16 +224,18 @@ app.post('/api/sign-in', async (req, res) => {
       fullName: normalizedName,
       votedPositions: [],
       candidateIds: [],
-      ipAddress: null,
+      deviceId: deviceId,
       sessionToken: sessionToken,
-      sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
+      sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 15 * 60 * 1000)), // 15 minutes
       signInTimestamp: admin.firestore.Timestamp.now(),
       voteTimestamp: null,
       createdAt: admin.firestore.Timestamp.now(),
-      status: 'active'
+      status: 'active',
+      totalVotes: 0
     };
 
     await newUserRef.set(userData);
+    console.log(`New user created: ${normalizedInstitutionalEmail}, Device ID: ${deviceId}`);
 
     const positions = await db.collection('Candidates').get();
     const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
@@ -246,16 +252,17 @@ app.post('/api/sign-in', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Sign-in error:', error);
+    console.error('Sign-in error for', institutionalEmail, ':', error);
     res.status(500).json({ error: 'Sign-in failed' });
   }
 });
 
-// Vote endpoint - Store in Users, no IP checking
+// Vote endpoint - Validate deviceId
 app.post('/api/vote', verifySession, async (req, res) => {
-  const { institutionalEmail, candidateId, position } = req.body;
+  const { institutionalEmail, candidateId, position, deviceId } = req.body;
 
-  if (!candidateId || !position) {
+  if (!candidateId || !position || !deviceId) {
+    console.log(`Vote failed for ${institutionalEmail}: Missing candidateId, position, or deviceId`);
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
@@ -267,23 +274,32 @@ app.post('/api/vote', verifySession, async (req, res) => {
       const userDoc = await transaction.get(userRef);
       
       if (!userDoc.exists) {
+        console.log(`Vote failed for ${normalizedInstitutionalEmail}: User not found`);
         throw new Error('User not found');
       }
 
       const userData = userDoc.data();
 
       if (userData.votedPositions && userData.votedPositions.includes(position)) {
+        console.log(`Vote failed for ${normalizedInstitutionalEmail}: Already voted for ${position}`);
         throw new Error(`You have already voted for ${position}`);
       }
 
       const candidateDoc = await transaction.get(db.collection('Candidates').doc(candidateId));
       if (!candidateDoc.exists) {
+        console.log(`Vote failed for ${normalizedInstitutionalEmail}: Candidate ${candidateId} not found`);
         throw new Error('Candidate not found');
       }
 
       const candidateData = candidateDoc.data();
       if (candidateData.position !== position) {
+        console.log(`Vote failed for ${normalizedInstitutionalEmail}: Candidate position mismatch (expected ${position}, got ${candidateData.position})`);
         throw new Error('Candidate position mismatch');
+      }
+
+      if (userData.deviceId !== deviceId) {
+        console.log(`Vote failed for ${normalizedInstitutionalEmail}: Device ID mismatch`);
+        throw new Error('Device ID mismatch');
       }
 
       // Update user with vote
@@ -291,9 +307,10 @@ app.post('/api/vote', verifySession, async (req, res) => {
         votedPositions: admin.firestore.FieldValue.arrayUnion(position),
         candidateIds: admin.firestore.FieldValue.arrayUnion({ position, candidateId }),
         lastVoteTimestamp: admin.firestore.Timestamp.now(),
-        lastVoteIp: req.clientIp,
         totalVotes: admin.firestore.FieldValue.increment(1)
       });
+
+      console.log(`Vote recorded for ${normalizedInstitutionalEmail}: ${position} -> ${candidateId}, Device ID: ${deviceId}`);
     });
 
     res.status(200).json({ 
@@ -302,7 +319,7 @@ app.post('/api/vote', verifySession, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Vote error:', error);
+    console.error(`Vote error for ${normalizedInstitutionalEmail}:`, error);
     res.status(400).json({ 
       error: 'Failed to submit vote', 
       details: error.message 
@@ -310,13 +327,14 @@ app.post('/api/vote', verifySession, async (req, res) => {
   }
 });
 
-// Complete Voting endpoint - Check and store IP when all positions are done
+// Complete Voting endpoint - Validate deviceId
 app.post('/api/complete-voting', verifySession, async (req, res) => {
-  const { institutionalEmail } = req.body;
+  const { institutionalEmail, deviceId } = req.body;
 
   try {
     const userDoc = await db.collection('Users').doc(req.userId).get();
     if (!userDoc.exists) {
+      console.log(`Complete voting failed for ${institutionalEmail}: User not found`);
       return res.status(400).json({ error: 'User not found' });
     }
 
@@ -326,36 +344,37 @@ app.post('/api/complete-voting', verifySession, async (req, res) => {
 
     // Check if user has voted for all positions
     if (!userData.votedPositions || userData.votedPositions.length < allPositions.length) {
+      console.log(`Complete voting failed for ${institutionalEmail}: Not all positions voted (${userData.votedPositions?.length || 0}/${allPositions.length})`);
       return res.status(400).json({ error: 'You have not completed voting for all positions' });
     }
 
-    // Check if IP has already completed voting
-    const ipDocs = await db.collection('Users')
-      .where('ipAddress', '==', req.clientIp)
-      .where('ipAddress', '!=', null)
+    // Check if deviceId has already completed voting
+    const deviceDocs = await db.collection('Users')
+      .where('deviceId', '==', deviceId)
+      .where('voteTimestamp', '!=', null)
       .get();
 
-    if (!ipDocs.empty) {
+    if (!deviceDocs.empty) {
       // Invalidate user's votes
       await db.collection('Users').doc(req.userId).update({
         candidateIds: [],
         votedPositions: [],
         totalVotes: 0,
-        ipAddress: null,
         voteTimestamp: null
       });
+      console.log(`Votes invalidated for ${institutionalEmail}: Duplicate device ID ${deviceId} detected`);
 
       return res.status(400).json({ 
-        error: 'This IP address has already been used to complete voting. Your votes have been invalidated.',
-        duplicateIP: true
+        error: 'This device has already been used to complete voting. Your votes have been invalidated.',
+        deviceBlocked: true
       });
     }
 
-    // Update user with IP address and vote timestamp
+    // Update user with vote timestamp
     await db.collection('Users').doc(req.userId).update({
-      ipAddress: req.clientIp,
       voteTimestamp: admin.firestore.Timestamp.now()
     });
+    console.log(`Voting completed for ${institutionalEmail}: Device ID ${deviceId}`);
 
     res.status(200).json({ 
       message: 'Voting completed successfully! Thank you for voting.',
@@ -363,7 +382,7 @@ app.post('/api/complete-voting', verifySession, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Complete voting error:', error);
+    console.error('Complete voting error for', institutionalEmail, ':', error);
     res.status(500).json({ error: 'Failed to complete voting' });
   }
 });
@@ -375,6 +394,7 @@ app.get('/api/positions', async (req, res) => {
     const positions = [...new Set(candidates.docs.map(doc => doc.data().position))].sort();
     res.status(200).json(positions);
   } catch (error) {
+    console.error('Error fetching positions:', error);
     res.status(500).json({ error: 'Failed to fetch positions' });
   }
 });
@@ -397,6 +417,7 @@ app.get('/api/candidates/:position', async (req, res) => {
     
     res.status(200).json(candidateList);
   } catch (error) {
+    console.error('Error fetching candidates for', position, ':', error);
     res.status(500).json({ error: 'Failed to fetch candidates' });
   }
 });
@@ -405,7 +426,7 @@ app.get('/api/candidates/:position', async (req, res) => {
 app.get('/api/public/votes', async (req, res) => {
   try {
     const candidates = await db.collection('Candidates').get();
-    const users = await db.collection('Users').where('ipAddress', '!=', null).get();
+    const users = await db.collection('Users').where('voteTimestamp', '!=', null).get();
     
     const voteCounts = {};
     let totalValidVotes = 0;
@@ -417,10 +438,10 @@ app.get('/api/public/votes', async (req, res) => {
       voteCounts[position].push({ name, votes: 0 });
     });
     
-    // Count votes from Users collection (only valid votes with ipAddress)
+    // Count votes from Users collection (only valid votes with voteTimestamp)
     users.docs.forEach(user => {
       const userData = user.data();
-      if (userData.candidateIds && userData.ipAddress) {
+      if (userData.candidateIds && userData.voteTimestamp) {
         userData.candidateIds.forEach(vote => {
           const { position, candidateId } = vote;
           const candidateDoc = candidates.docs.find(c => c.id === candidateId);
@@ -480,8 +501,8 @@ app.get('/api/dev/votes-table', async (req, res) => {
             position: vote.position,
             candidateName: candidateDoc ? candidateDoc.data().name : 'Unknown Candidate',
             timestamp: formattedTimestamp,
-            ipAddress: userData.ipAddress || 'Not completed',
-            isValid: userData.ipAddress !== null
+            deviceId: userData.deviceId || 'Not set',
+            isValid: userData.voteTimestamp !== null
           });
         });
       }
