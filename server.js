@@ -1,7 +1,7 @@
+require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-require('dotenv').config();
 
 const app = express();
 
@@ -39,37 +39,6 @@ app.use((req, res, next) => {
 // Generate session token
 const generateSessionToken = () => {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
-};
-
-// Check if IP has completed voting (ONLY check after all positions)
-const checkIPCompletedVoting = async (ipAddress) => {
-  try {
-    console.log('🔍 Checking if IP completed voting:', ipAddress);
-    
-    const completedIPs = await db.collection('CompletedVotingIPs')
-      .where('ipAddress', '==', ipAddress)
-      .get();
-
-    return !completedIPs.empty;
-  } catch (error) {
-    console.error('Error checking IP completion:', error);
-    return false;
-  }
-};
-
-// Store IP as completed voting
-const storeIPAsCompleted = async (ipAddress, institutionalEmail) => {
-  try {
-    const completedRef = db.collection('CompletedVotingIPs').doc();
-    await completedRef.set({
-      ipAddress: ipAddress,
-      institutionalEmail: institutionalEmail,
-      completedAt: admin.firestore.Timestamp.now()
-    });
-    console.log('✅ IP stored as completed voting:', ipAddress);
-  } catch (error) {
-    console.error('Error storing completed IP:', error);
-  }
 };
 
 // Check for duplicate personal email
@@ -120,7 +89,7 @@ const verifySession = async (req, res, next) => {
   }
 };
 
-// Sign In - No IP checking during sign-in
+// Sign In - No IP checking
 app.post('/api/sign-in', async (req, res) => {
   const { institutionalEmail, personalEmail, matricNumber, fullName } = req.body;
   
@@ -179,7 +148,7 @@ app.post('/api/sign-in', async (req, res) => {
   try {
     console.log('🔄 Sign-in attempt from IP:', req.clientIp, 'for:', institutionalEmail);
 
-    // Check for duplicate personal email only
+    // Check for duplicate personal email
     const { duplicateFound, duplicateEmail } = await checkDuplicatePersonalEmail(normalizedPersonalEmail);
     
     if (duplicateFound) {
@@ -199,14 +168,14 @@ app.post('/api/sign-in', async (req, res) => {
     let sessionToken = generateSessionToken();
 
     if (!userDocs.empty) {
-      // EXISTING USER - Check if they've completed voting
+      // Existing user
       userId = userDocs.docs[0].id;
       userData = userDocs.docs[0].data();
       
       const positions = await db.collection('Candidates').get();
       const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
       
-      if (userData.votedPositions && userData.votedPositions.length >= allPositions.length) {
+      if (userData.votedPositions && userData.votedPositions.length >= allPositions.length && userData.ipAddress) {
         return res.status(400).json({ 
           error: 'You have already completed voting for all positions',
           alreadyVoted: true 
@@ -240,7 +209,7 @@ app.post('/api/sign-in', async (req, res) => {
       });
     }
 
-    // NEW USER - Create account
+    // New user
     const newUserRef = db.collection('Users').doc();
     userId = newUserRef.id;
 
@@ -250,7 +219,8 @@ app.post('/api/sign-in', async (req, res) => {
       matricNumber: normalizedMatric,
       fullName: normalizedName,
       votedPositions: [],
-      ipAddress: req.clientIp,
+      candidateIds: [],
+      ipAddress: null,
       sessionToken: sessionToken,
       sessionExpiry: admin.firestore.Timestamp.fromDate(new Date(Date.now() + 2 * 60 * 60 * 1000)),
       signInTimestamp: admin.firestore.Timestamp.now(),
@@ -281,7 +251,7 @@ app.post('/api/sign-in', async (req, res) => {
   }
 });
 
-// Vote endpoint - No IP checking during individual votes
+// Vote endpoint - Store in Users, no IP checking
 app.post('/api/vote', verifySession, async (req, res) => {
   const { institutionalEmail, candidateId, position } = req.body;
 
@@ -316,33 +286,19 @@ app.post('/api/vote', verifySession, async (req, res) => {
         throw new Error('Candidate position mismatch');
       }
 
-      // Record the vote (ALWAYS valid during voting session)
-      const voteRef = db.collection('Votes').doc();
-      transaction.set(voteRef, {
-        candidateId,
-        userId: req.userId,
-        userInstitutionalEmail: normalizedInstitutionalEmail,
-        position,
-        ipAddress: req.clientIp,
-        timestamp: admin.firestore.Timestamp.now(),
-        userAgent: req.headers['user-agent'],
-        isValid: true, // All votes are valid during voting session
-        votingSession: true // Mark as part of voting session
-      });
-
-      // Update user voted positions
+      // Update user with vote
       transaction.update(userRef, {
         votedPositions: admin.firestore.FieldValue.arrayUnion(position),
+        candidateIds: admin.firestore.FieldValue.arrayUnion({ position, candidateId }),
         lastVoteTimestamp: admin.firestore.Timestamp.now(),
         lastVoteIp: req.clientIp,
-        totalVotes: (userData.totalVotes || 0) + 1
+        totalVotes: admin.firestore.FieldValue.increment(1)
       });
     });
 
     res.status(200).json({ 
       message: 'Vote submitted successfully',
-      position: position,
-      counted: true
+      position: position
     });
 
   } catch (error) {
@@ -354,12 +310,11 @@ app.post('/api/vote', verifySession, async (req, res) => {
   }
 });
 
-// Complete Voting endpoint - Store IP only when ALL positions are done
+// Complete Voting endpoint - Check and store IP when all positions are done
 app.post('/api/complete-voting', verifySession, async (req, res) => {
   const { institutionalEmail } = req.body;
 
   try {
-    // Check if user has voted for all positions
     const userDoc = await db.collection('Users').doc(req.userId).get();
     if (!userDoc.exists) {
       return res.status(400).json({ error: 'User not found' });
@@ -369,39 +324,38 @@ app.post('/api/complete-voting', verifySession, async (req, res) => {
     const positions = await db.collection('Candidates').get();
     const allPositions = [...new Set(positions.docs.map(doc => doc.data().position))];
 
-    // Check if user has completed all positions
+    // Check if user has voted for all positions
     if (!userData.votedPositions || userData.votedPositions.length < allPositions.length) {
       return res.status(400).json({ error: 'You have not completed voting for all positions' });
     }
 
     // Check if IP has already completed voting
-    const ipHasCompleted = await checkIPCompletedVoting(req.clientIp);
-    if (ipHasCompleted) {
-      console.log('🚫 IP already completed voting - invalidating all votes');
-      
-      // Invalidate all votes from this IP
-      const votesSnapshot = await db.collection('Votes')
-        .where('ipAddress', '==', req.clientIp)
-        .get();
+    const ipDocs = await db.collection('Users')
+      .where('ipAddress', '==', req.clientIp)
+      .where('ipAddress', '!=', null)
+      .get();
 
-      const batch = db.batch();
-      votesSnapshot.docs.forEach(doc => {
-        batch.update(doc.ref, {
-          isValid: false,
-          isDuplicateIP: true,
-          invalidatedAt: admin.firestore.Timestamp.now()
-        });
+    if (!ipDocs.empty) {
+      // Invalidate user's votes
+      await db.collection('Users').doc(req.userId).update({
+        candidateIds: [],
+        votedPositions: [],
+        totalVotes: 0,
+        ipAddress: null,
+        voteTimestamp: null
       });
-      await batch.commit();
 
       return res.status(400).json({ 
-        error: 'This IP address has already been used to complete voting. All votes from this IP have been invalidated.',
+        error: 'This IP address has already been used to complete voting. Your votes have been invalidated.',
         duplicateIP: true
       });
     }
 
-    // Store IP as completed voting
-    await storeIPAsCompleted(req.clientIp, institutionalEmail);
+    // Update user with IP address and vote timestamp
+    await db.collection('Users').doc(req.userId).update({
+      ipAddress: req.clientIp,
+      voteTimestamp: admin.firestore.Timestamp.now()
+    });
 
     res.status(200).json({ 
       message: 'Voting completed successfully! Thank you for voting.',
@@ -447,15 +401,14 @@ app.get('/api/candidates/:position', async (req, res) => {
   }
 });
 
-// Public results - ONLY COUNT VALID VOTES
+// Public results
 app.get('/api/public/votes', async (req, res) => {
   try {
     const candidates = await db.collection('Candidates').get();
-    const votes = await db.collection('Votes').get();
+    const users = await db.collection('Users').where('ipAddress', '!=', null).get();
     
     const voteCounts = {};
     let totalValidVotes = 0;
-    let totalInvalidVotes = 0;
     
     // Initialize positions with candidates
     candidates.docs.forEach(candidateDoc => {
@@ -464,23 +417,22 @@ app.get('/api/public/votes', async (req, res) => {
       voteCounts[position].push({ name, votes: 0 });
     });
     
-    // Count only valid votes (isValid !== false)
-    votes.docs.forEach(vote => {
-      const voteData = vote.data();
-      const { candidateId, position, isValid } = voteData;
-      
-      if (isValid !== false) {
-        const candidateDoc = candidates.docs.find(c => c.id === candidateId);
-        if (candidateDoc && candidateDoc.data().position === position) {
-          const { name } = candidateDoc.data();
-          const candidateInPosition = voteCounts[position].find(c => c.name === name);
-          if (candidateInPosition) {
-            candidateInPosition.votes += 1;
-            totalValidVotes++;
+    // Count votes from Users collection (only valid votes with ipAddress)
+    users.docs.forEach(user => {
+      const userData = user.data();
+      if (userData.candidateIds && userData.ipAddress) {
+        userData.candidateIds.forEach(vote => {
+          const { position, candidateId } = vote;
+          const candidateDoc = candidates.docs.find(c => c.id === candidateId);
+          if (candidateDoc && candidateDoc.data().position === position) {
+            const { name } = candidateDoc.data();
+            const candidateInPosition = voteCounts[position].find(c => c.name === name);
+            if (candidateInPosition) {
+              candidateInPosition.votes += 1;
+              totalValidVotes++;
+            }
           }
-        }
-      } else {
-        totalInvalidVotes++;
+        });
       }
     });
     
@@ -492,12 +444,12 @@ app.get('/api/public/votes', async (req, res) => {
     res.status(200).json({
       voteCounts,
       totalValidVotes,
-      totalInvalidVotes,
-      totalVotes: votes.size,
+      totalVotes: totalValidVotes,
       lastUpdated: new Date().toISOString()
     });
     
   } catch (error) {
+    console.error('Error fetching vote results:', error);
     res.status(500).json({ error: 'Failed to fetch vote results' });
   }
 });
@@ -505,35 +457,34 @@ app.get('/api/public/votes', async (req, res) => {
 // Development votes table
 app.get('/api/dev/votes-table', async (req, res) => {
   try {
-    const votesSnapshot = await db.collection('Votes').get();
-    const candidatesSnapshot = await db.collection('Candidates').get();
-    const usersSnapshot = await db.collection('Users').get();
+    const users = await db.collection('Users').get();
+    const candidates = await db.collection('Candidates').get();
     
-    const voteList = votesSnapshot.docs.map(doc => {
-      const voteData = doc.data();
-      const candidateDoc = candidatesSnapshot.docs.find(c => c.id === voteData.candidateId);
-      const userDoc = usersSnapshot.docs.find(u => u.id === voteData.userId);
-      
-      let formattedTimestamp = 'N/A';
-      if (voteData.timestamp) {
-        if (voteData.timestamp.toDate) {
-          formattedTimestamp = voteData.timestamp.toDate().toLocaleString();
-        } else if (voteData.timestamp._seconds) {
-          formattedTimestamp = new Date(voteData.timestamp._seconds * 1000).toLocaleString();
-        }
+    const voteList = [];
+    
+    users.docs.forEach(user => {
+      const userData = user.data();
+      if (userData.candidateIds) {
+        userData.candidateIds.forEach(vote => {
+          const candidateDoc = candidates.docs.find(c => c.id === vote.candidateId);
+          let formattedTimestamp = 'N/A';
+          if (userData.voteTimestamp) {
+            formattedTimestamp = userData.voteTimestamp.toDate
+              ? userData.voteTimestamp.toDate().toLocaleString()
+              : new Date(userData.voteTimestamp._seconds * 1000).toLocaleString();
+          }
+          
+          voteList.push({
+            id: `${user.id}-${vote.position}`,
+            userInstitutionalEmail: userData.institutionalEmail,
+            position: vote.position,
+            candidateName: candidateDoc ? candidateDoc.data().name : 'Unknown Candidate',
+            timestamp: formattedTimestamp,
+            ipAddress: userData.ipAddress || 'Not completed',
+            isValid: userData.ipAddress !== null
+          });
+        });
       }
-      
-      return {
-        id: doc.id,
-        userInstitutionalEmail: voteData.userInstitutionalEmail || (userDoc ? userDoc.data().institutionalEmail : 'Unknown'),
-        position: voteData.position,
-        candidateName: candidateDoc ? candidateDoc.data().name : 'Unknown Candidate',
-        timestamp: formattedTimestamp,
-        ipAddress: voteData.ipAddress,
-        isValid: voteData.isValid !== false,
-        isDuplicateIP: voteData.isDuplicateIP || false,
-        status: voteData.isValid === false ? 'INVALID (Duplicate IP)' : 'VALID'
-      };
     });
     
     // Sort by timestamp descending
