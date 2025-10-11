@@ -282,7 +282,137 @@ app.get('/api/dev/votes-table', (req, res) => {
   }
 });
 
+// =====================
+// EMERGENCY BACKUP ROUTES
+// =====================
+
+// Get all users (NEW - for backup)
+app.get('/api/backup/users', (req, res) => {
+  try {
+    const users = db.prepare('SELECT * FROM Users').all();
+    res.json({
+      count: users.length,
+      users: users
+    });
+  } catch (error) {
+    console.error('Users backup error:', error);
+    res.status(500).json({ error: 'Failed to backup users' });
+  }
+});
+
+// Get votes table data (NEW - for backup)
+app.get('/api/backup/votes-table', (req, res) => {
+  try {
+    const votes = db.prepare(`
+      SELECT v.id, v.userInstitutionalEmail, v.candidateName, v.position, v.timestamp, v.isValid
+      FROM Votes v
+      ORDER BY v.timestamp DESC
+    `).all();
+
+    const totalVotes = db.prepare('SELECT COUNT(*) as count FROM Votes WHERE isValid = 1').get().count;
+
+    res.json({ 
+      votes, 
+      totalVotes, 
+      lastUpdated: new Date().toISOString() 
+    });
+  } catch (error) {
+    console.error('Votes table backup error:', error);
+    res.status(500).json({ error: 'Failed to backup votes table' });
+  }
+});
+
+// Download backup as JSON file
+app.get('/api/backup/download', (req, res) => {
+  try {
+    const users = db.prepare('SELECT * FROM Users').all();
+    const votes = db.prepare('SELECT * FROM Votes').all();
+    const candidates = db.prepare('SELECT * FROM Candidates').all();
+    
+    const backupData = {
+      _warning: "ELECTION DATA BACKUP - SAVE THIS FILE",
+      timestamp: new Date().toISOString(),
+      election: "NACOS Election 2024",
+      data: {
+        users: users,
+        votes: votes,
+        candidates: candidates
+      },
+      counts: {
+        users: users.length,
+        votes: votes.length,
+        candidates: candidates.length
+      }
+    };
+
+    // Set headers for file download
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="election-backup-${Date.now()}.json"`);
+    
+    res.send(JSON.stringify(backupData, null, 2));
+  } catch (error) {
+    console.error('Download backup error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Emergency full backup
+app.get('/api/emergency-backup', (req, res) => {
+  try {
+    const users = db.prepare('SELECT * FROM Users').all();
+    const votes = db.prepare('SELECT * FROM Votes').all();
+    const candidates = db.prepare('SELECT * FROM Candidates').all();
+    
+    res.json({
+      _warning: "SAVE THIS DATA IMMEDIATELY - Database will be lost on future deploys",
+      timestamp: new Date().toISOString(),
+      users_count: users.length,
+      votes_count: votes.length,
+      candidates_count: candidates.length,
+      users: users,
+      votes: votes,
+      candidates: candidates
+    });
+  } catch (error) {
+    console.error('Emergency backup error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Simple backup verification
+app.get('/api/backup/status', (req, res) => {
+  try {
+    const userCount = db.prepare('SELECT COUNT(*) as count FROM Users').get().count;
+    const voteCount = db.prepare('SELECT COUNT(*) as count FROM Votes').get().count;
+    const candidateCount = db.prepare('SELECT COUNT(*) as count FROM Candidates').get().count;
+    
+    res.json({
+      message: "Backup endpoints are active",
+      counts: {
+        users: userCount,
+        votes: voteCount,
+        candidates: candidateCount
+      },
+      backup_urls: {
+        download: "/api/backup/download",
+        all_data: "/api/emergency-backup",
+        users_only: "/api/backup/users",
+        votes_table: "/api/backup/votes-table",
+        status: "/api/backup/status"
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`🚨 EMERGENCY BACKUP ENDPOINTS ACTIVATED:`);
+  console.log(`   - Download: https://yourapp.onrender.com/api/backup/download`);
+  console.log(`   - Full backup: https://yourapp.onrender.com/api/emergency-backup`);
+  console.log(`   - Users only: https://yourapp.onrender.com/api/backup/users`);
+  console.log(`   - Votes table: https://yourapp.onrender.com/api/backup/votes-table`);
+  console.log(`   - Status: https://yourapp.onrender.com/api/backup/status`);
 });
