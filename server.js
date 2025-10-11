@@ -27,19 +27,15 @@ const generateSessionToken = () => {
 // Check for duplicate personal email
 const checkDuplicatePersonalEmail = async (personalEmail) => {
   try {
-    const users = await db.collection('Users').get();
-    let duplicateFound = false;
-    let duplicateEmail = '';
-
-    users.docs.forEach(doc => {
-      const userData = doc.data();
-      if (userData.personalEmail && userData.personalEmail.toLowerCase() === personalEmail.toLowerCase()) {
-        duplicateFound = true;
-        duplicateEmail = userData.institutionalEmail;
-      }
-    });
-
-    return { duplicateFound, duplicateEmail };
+    const normalizedEmail = personalEmail.toLowerCase();
+    const userDocs = await db.collection('Users')
+      .where('personalEmail', '==', normalizedEmail)
+      .limit(1)
+      .get();
+    return {
+      duplicateFound: !userDocs.empty,
+      duplicateEmail: userDocs.empty ? '' : userDocs.docs[0].data().institutionalEmail
+    };
   } catch (error) {
     console.error('Error checking duplicate personal email:', error);
     return { duplicateFound: false, duplicateEmail: '' };
@@ -253,6 +249,9 @@ app.post('/api/sign-in', async (req, res) => {
 
   } catch (error) {
     console.error('Sign-in error for', institutionalEmail, ':', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Sign-in failed' });
   }
 });
@@ -320,6 +319,9 @@ app.post('/api/vote', verifySession, async (req, res) => {
 
   } catch (error) {
     console.error(`Vote error for ${normalizedInstitutionalEmail}:`, error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(400).json({ 
       error: 'Failed to submit vote', 
       details: error.message 
@@ -383,6 +385,9 @@ app.post('/api/complete-voting', verifySession, async (req, res) => {
 
   } catch (error) {
     console.error('Complete voting error for', institutionalEmail, ':', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Failed to complete voting' });
   }
 });
@@ -395,6 +400,9 @@ app.get('/api/positions', async (req, res) => {
     res.status(200).json(positions);
   } catch (error) {
     console.error('Error fetching positions:', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Failed to fetch positions' });
   }
 });
@@ -418,6 +426,9 @@ app.get('/api/candidates/:position', async (req, res) => {
     res.status(200).json(candidateList);
   } catch (error) {
     console.error('Error fetching candidates for', position, ':', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Failed to fetch candidates' });
   }
 });
@@ -471,6 +482,9 @@ app.get('/api/public/votes', async (req, res) => {
     
   } catch (error) {
     console.error('Error fetching vote results:', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Failed to fetch vote results' });
   }
 });
@@ -525,6 +539,9 @@ app.get('/api/dev/votes-table', async (req, res) => {
     
   } catch (error) {
     console.error('Error fetching votes table:', error);
+    if (error.code === 'resource-exhausted') {
+      return res.status(429).json({ error: 'Server busy due to high traffic. Please try again in a few minutes.' });
+    }
     res.status(500).json({ error: 'Failed to fetch votes table' });
   }
 });
