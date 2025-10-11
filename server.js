@@ -156,8 +156,8 @@ app.post('/api/sign-in', async (req, res) => {
     if (!deviceDocs.empty) {
       console.log(`Duplicate device ID ${deviceId} found for ${normalizedInstitutionalEmail}`);
       return res.status(400).json({ 
-        error: 'This device has already been used to vote.',
-        deviceBlocked: true 
+        error: 'You have already voted.',
+        alreadyVoted: true 
       });
     }
 
@@ -181,7 +181,7 @@ app.post('/api/sign-in', async (req, res) => {
       if (userData.votedPositions && userData.votedPositions.length >= allPositions.length && userData.voteTimestamp) {
         console.log(`User ${normalizedInstitutionalEmail} has already completed voting`);
         return res.status(400).json({ 
-          error: 'You have already completed voting for all positions',
+          error: 'You have already voted.',
           alreadyVoted: true 
         });
       }
@@ -365,8 +365,8 @@ app.post('/api/complete-voting', verifySession, async (req, res) => {
       console.log(`Votes invalidated for ${institutionalEmail}: Duplicate device ID ${deviceId} detected`);
 
       return res.status(400).json({ 
-        error: 'This device has already been used to complete voting. Your votes have been invalidated.',
-        deviceBlocked: true
+        error: 'You have already voted.',
+        alreadyVoted: true
       });
     }
 
